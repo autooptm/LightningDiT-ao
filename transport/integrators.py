@@ -1,3 +1,6 @@
+import contextlib
+import os
+
 import numpy as np
 import torch as th
 import torch.nn as nn
@@ -74,6 +77,111 @@ class sde:
 
         return samples
 
+#
+#
+#
+#
+
+def _ao_enabled(name, default=True):
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+class _AoEulerRunner:
+
+    def __init__(self, t_grid, use_step):
+        self.t = t_grid
+        self.dt = t_grid[1:] - t_grid[:-1]
+        self.n_steps = len(t_grid) - 1
+        self.use_step = use_step
+        self._steps = {}
+
+    @staticmethod
+    def _opt_ctx(model):
+        owner = getattr(model, "__self__", None)
+        dtype = None
+        if owner is not None:
+            try:
+                dtype = next(owner.parameters()).dtype
+            except (StopIteration, AttributeError):
+                dtype = None
+        if dtype in (th.float16, th.bfloat16):
+            return th.autocast("cuda", dtype=dtype)
+        return contextlib.nullcontext()
+
+    def _step_for(self, x, model, model_kwargs):
+        key = (tuple(x.shape), x.dtype)
+        cached = self._steps.get(key)
+        if cached is not None:
+            return cached
+
+        sx = th.zeros_like(x)
+        st = th.zeros(x.shape[0], device=x.device, dtype=self.t.dtype)
+        sdt = th.zeros((), device=x.device, dtype=self.dt.dtype)
+        kws = dict(model_kwargs)
+        static_y = None
+        if "y" in kws and th.is_tensor(kws["y"]):
+            static_y = th.zeros_like(kws["y"])
+            kws["y"] = static_y
+
+        side = th.cuda.Stream()
+        side.wait_stream(th.cuda.current_stream())
+        with th.cuda.stream(side):
+            for _ in range(3):
+                with self._opt_ctx(model):
+                    sx.add_(sdt * model(sx, st, **kws))
+        th.cuda.current_stream().wait_stream(side)
+        th.cuda.synchronize()
+
+        g = th.cuda.CUDAGraph()
+        with th.cuda.graph(g):
+            with self._opt_ctx(model):
+                sx.add_(sdt * model(sx, st, **kws))
+
+        probe = th.randn_like(sx)
+        pt = self.t[0].expand(x.shape[0]).clone()
+        pdt = self.dt[0].clone()
+        if static_y is not None:
+            static_y.copy_(model_kwargs["y"])
+        sx.copy_(probe); st.copy_(pt); sdt.copy_(pdt)
+        g.replay()
+        got = sx.clone()
+        sx.copy_(probe); st.copy_(pt); sdt.copy_(pdt)
+        with th.no_grad(), self._opt_ctx(model):
+            sx.add_(sdt * model(sx, st, **kws))
+        err = (got - sx).abs().max().item()
+        scale = sx.abs().max().item() or 1.0
+        if not err <= 1e-3 * scale:
+            raise RuntimeError(
+                "AO_LDIT_OPT_1: optimized path disagrees with the stock path for %s "
+                "(max|diff| %.3g against a state scale of %.3g). "
+                "Set AO_LDIT_OPT_1=0 to fall back." % (key, err, scale))
+
+        cached = (g, sx, st, sdt, static_y)
+        self._steps[key] = cached
+        return cached
+
+    def run(self, x, model, **model_kwargs):
+        if self.use_step and x.is_cuda:
+            g, sx, st, sdt, sy = self._step_for(x, model, model_kwargs)
+            sx.copy_(x)
+            if sy is not None:
+                sy.copy_(model_kwargs["y"])
+            for i in range(self.n_steps):
+                st.copy_(self.t[i].expand(x.shape[0]))
+                sdt.copy_(self.dt[i])
+                g.replay()
+            return sx.clone()
+
+        with self._opt_ctx(model):
+            for i in range(self.n_steps):
+                x = x + self.dt[i] * model(x, self.t[i].expand(x.shape[0]),
+                                           **model_kwargs)
+        return x
+
+
 class ode:
     """ODE solver class"""
     def __init__(
@@ -105,7 +213,15 @@ class ode:
         self.sampler_type = sampler_type
 
     def sample(self, x, model, **model_kwargs):
-        
+
+        if (self.sampler_type == "euler" and not isinstance(x, tuple)
+                and _ao_enabled("AO_LDIT_FAST_EULER")):
+            if getattr(self, "_ao_runner", None) is None:
+                self._ao_runner = _AoEulerRunner(
+                    self.t.to(x.device),
+                    use_step=_ao_enabled("AO_LDIT_OPT_1") and x.is_cuda)
+            return [self._ao_runner.run(x, model, **model_kwargs)]
+
         device = x[0].device if isinstance(x, tuple) else x.device
         def _fn(t, x):
             t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t

@@ -1,4 +1,60 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>LightningDiT · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.98x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.98x-2ea44f"></a>
+    <a href="https://github.com/hustvl/LightningDiT/commit/f315f25b6aaad600b4d8e50a8167ce06f2e957f3"><img alt="base" src="https://img.shields.io/badge/upstream-f315f25b6aaa-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [hustvl/LightningDiT](https://github.com/hustvl/LightningDiT) at commit
+> [`f315f25b6aaa`](https://github.com/hustvl/LightningDiT/commit/f315f25b6aaad600b4d8e50a8167ce06f2e957f3) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python inference.py --config configs/reproductions/lightningdit_xl_vavae_f16d32_64ep_cfg.yaml --demo` |
+| **Entry point** | `inference.py` |
+| **Unit measured** | one demo sample: a class label and a fresh latent → the 250-step sampler with classifier-free guidance on LightningDiT-XL/1 → de-normalise → VA-VAE decode → one 256×256 image (eight of them make `demo_images/demo_samples.png`) |
+| **Before (stock)** | 3,038 ms per unit (27.1 s for the timed loop over the 8 demo classes) |
+| **After (this tree, all switches default ON)** | 1,343 ms per unit (13.7 s for the timed loop; start-up, excluded, also drops from 25.5 s to 19.7 s) |
+| **Speedup** | **1.98x** end to end on RTX 4090, noise floor of the host 0.4% |
+| **Output** | not bit-identical: the generated images score 41.6 dB PSNR against the stock program's (worst 1% of pixels excluded; median pixel difference 1 of 255 levels) and 40.0 dB on held-out batch sizes the optimiser never saw; the sampler recipe (250 steps, CFG scale) is unchanged and the demo grid is written to the same place |
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `transport/integrators.py` | ode.sample() | 1.10x (alone) |
+| `inference.py` | do_sample() | 1.01x alone, 2.28x together with `integrators.py` |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/LightningDiT-ao.git
+cd LightningDiT-ao
+# set up exactly as upstream documents (the LightningDiT-XL 64-epoch and VA-VAE f16d32 checkpoints, with the config pointed at them), then:
+python inference.py --config configs/reproductions/lightningdit_xl_vavae_f16d32_64ep_cfg.yaml --demo
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff f315f25b6aaa` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+<div align="center">
 
 <h2>⚡Reconstruction <i>vs.</i> Generation:
 

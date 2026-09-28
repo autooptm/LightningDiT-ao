@@ -85,11 +85,24 @@ def do_sample(train_config, accelerator, ckpt_path=None, cfg_scale=None, model=N
         downsample_ratio = 16
     latent_size = train_config['data']['image_size'] // downsample_ratio
 
-    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", mmap=True)
+    except (RuntimeError, TypeError, ValueError):
+        checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
     if "ema" in checkpoint:  # supports checkpoints from train.py
         checkpoint = checkpoint["ema"]
     model.load_state_dict(checkpoint)
     model.eval()  # important!
+    del checkpoint
+
+    _ao_mode = os.environ.get("AO_LDIT_OPT_2", "bf16").strip().lower()
+    if _ao_mode in ("bf16", "bfloat16"):
+        model.to(torch.bfloat16)
+    elif _ao_mode in ("fp16", "float16", "half"):
+        model.to(torch.float16)
+    elif _ao_mode not in ("fp32", "float32", "", "off"):
+        raise ValueError("AO_LDIT_OPT_2 must be bf16, fp16 or fp32; got %r" % _ao_mode)
+
     model.to(device)
 
     transport = create_transport(
